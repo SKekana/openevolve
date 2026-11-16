@@ -57,8 +57,13 @@ class LLMModelConfig:
     name: str = None
 
     # LLM provider: "openai" (default), "claude_code" (Claude Code CLI)
-    # Also supports "copilot_cli" (GitHub Copilot CLI)
+    # Also supports "copilot_cli", "codex_cli", and "opencode_cli" CLI backends.
+    # "antigravity_cli" uses a guarded CLI; "antigravity_acp" uses Google's ACP server.
     provider: Optional[str] = None
+
+    # Official Antigravity ACP executable and dedicated Gemini profile directory.
+    antigravity_acp_path: Optional[str] = None
+    antigravity_acp_home: Optional[str] = None
 
     # Custom LLM client
     init_client: Optional[Callable] = None
@@ -187,6 +192,8 @@ class LLMConfig(LLMModelConfig):
             # OpenAI backend. Propagation uses overwrite=False, so an explicit
             # per-model provider still wins.
             "provider": self.provider,
+            "antigravity_acp_path": self.antigravity_acp_path,
+            "antigravity_acp_home": self.antigravity_acp_home,
             "api_base": self.api_base,
             "api_key": self.api_key,
             "temperature": self.temperature,
@@ -244,6 +251,8 @@ class LLMConfig(LLMModelConfig):
             # See the note in __post_init__: `provider` has to be propagated here too,
             # or rebuilding the models drops a top-level provider back to None.
             "provider": self.provider,
+            "antigravity_acp_path": self.antigravity_acp_path,
+            "antigravity_acp_home": self.antigravity_acp_home,
             "api_base": self.api_base,
             "api_key": self.api_key,
             "temperature": self.temperature,

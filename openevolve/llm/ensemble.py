@@ -7,18 +7,27 @@ import logging
 import random
 from typing import Dict, List, Optional, Tuple
 
-from openevolve.llm.base import LLMInterface
-from openevolve.llm.openai import OpenAILLM
 from openevolve.config import LLMModelConfig
+from openevolve.llm.antigravity_acp import AntigravityACPLLM
+from openevolve.llm.antigravity_cli import AntigravityCLILLM
+from openevolve.llm.base import LLMInterface
+from openevolve.llm.codex_cli import CodexCLILLM
+from openevolve.llm.openai import OpenAILLM
+from openevolve.llm.opencode_cli import OpenCodeCLILLM
 
 logger = logging.getLogger(__name__)
 
 _PROVIDER_REGISTRY = {
     "openai": lambda cfg: OpenAILLM(cfg),
+    "codex_cli": lambda cfg: CodexCLILLM(cfg),
+    "opencode_cli": lambda cfg: OpenCodeCLILLM(cfg),
+    "antigravity_cli": lambda cfg: AntigravityCLILLM(cfg),
+    "antigravity_acp": lambda cfg: AntigravityACPLLM(cfg),
 }
 
 try:
     from openevolve.llm.claude_code import ClaudeCodeLLM
+
     _PROVIDER_REGISTRY["claude_code"] = lambda cfg: ClaudeCodeLLM(cfg)
 except ImportError:
     pass

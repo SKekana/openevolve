@@ -455,6 +455,110 @@ See the [Copilot CLI quickstart example](examples/copilot_cli_quickstart/) for a
 
 </details>
 
+<details>
+<summary><b>Codex CLI (Saved CLI Login)</b></summary>
+
+Use [Codex CLI](https://learn.chatgpt.com/docs/non-interactive-mode) as the LLM
+backend with your existing CLI login:
+
+```bash
+npm install -g @openai/codex
+codex login
+```
+
+```yaml
+llm:
+  provider: codex_cli
+  retries: 2
+  retry_delay: 5
+  models:
+    - name: gpt-6.1-sol
+      weight: 0.3
+      reasoning_effort: high
+      timeout: 600
+    - name: gpt-6-luna
+      weight: 0.7
+      reasoning_effort: medium
+      timeout: 300
+```
+
+Each call samples one model. Codex returns code or diffs for OpenEvolve to apply
+and evaluate, using isolated invocation settings while retaining CLI authentication.
+See the [Codex CLI quickstart](examples/codex_cli_quickstart/) for the complete
+10-iteration example, supported options, and tests.
+
+</details>
+
+<details>
+<summary><b>OpenCode CLI (Saved Provider Configuration)</b></summary>
+
+Use [OpenCode CLI](https://opencode.ai/docs/cli/) as the LLM backend with saved
+authentication and built-in or custom provider definitions:
+
+```bash
+npm install -g opencode-ai@1.18.32
+opencode auth login
+opencode models
+```
+
+```yaml
+llm:
+  provider: opencode_cli
+  retries: 2
+  retry_delay: 5
+  models:
+    - name: modal/sihlek55--ep-glm-5-3-server.us-west.modal.direct
+      weight: 0.3
+      timeout: 600
+    - name: modal/sihlek55--ep-glm-5-3-flash-server.us-west.modal.direct
+      weight: 0.7
+      timeout: 300
+```
+
+These Modal endpoints are account-specific examples; configure them in OpenCode
+or substitute available `provider/model` IDs. Each call samples one model and
+returns code or diffs for OpenEvolve to apply and evaluate. Calls use an isolated
+agent with all permissions denied, sharing disabled, and no inherited MCP servers,
+external plugins, or personal instructions while retaining CLI authentication.
+See the [OpenCode CLI quickstart](examples/opencode_cli_quickstart/) for the
+10-iteration example, supported parameters, usage reporting, and tests.
+
+</details>
+
+<details>
+<summary><b>Antigravity (Official ACP Server)</b></summary>
+
+Set `llm.provider: antigravity_acp` to use Google's official ACP server 1.3.0 with
+a dedicated personal Google login. Antigravity returns code or diffs for
+OpenEvolve to apply and evaluate. The Linux x86_64 installer verifies the pinned
+official archive:
+
+```bash
+python -m openevolve.antigravity_acp install
+python -m openevolve.antigravity_acp login
+```
+
+```yaml
+llm:
+  provider: antigravity_acp
+  models:
+    - name: gemini-3.8-flash-medium
+      weight: 1.0
+      timeout: 300
+```
+
+Each call uses a fresh session, disabled client filesystem/terminal capabilities,
+and a verified `finish`-only tool filter. Evolution runs require cached credentials
+and do not open browser login. See the [Antigravity ACP quickstart](examples/antigravity_acp_quickstart/)
+for setup, options, tests, and the 10-iteration function-minimization example.
+
+The separate `antigravity_cli` provider remains available for compatible CLI
+releases. AGY 1.2.16 fails its initialization tool-restriction check before a
+prompt is sent; use the ACP provider on that release. Details are in the
+[CLI compatibility notes](examples/antigravity_cli_quickstart/).
+
+</details>
+
 ## Examples Gallery
 
 <div align="center">

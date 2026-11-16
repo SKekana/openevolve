@@ -28,6 +28,37 @@ Multiple example configurations for different scenarios:
 
 Includes guidelines for choosing parameters based on your problem characteristics.
 
+## Codex CLI provider
+
+Set `llm.provider: codex_cli` and configure explicit model names. The
+[Codex CLI quickstart](../examples/codex_cli_quickstart/) provides a complete
+configuration with 30% `gpt-6.1-sol` (`high` reasoning, 600-second timeout) and
+70% `gpt-6-luna` (`medium` reasoning, 300-second timeout).
+
+The provider uses saved Codex CLI authentication and supports model weights,
+`reasoning_effort`, `timeout`, `retries`, and `retry_delay`. It ignores personal
+Codex configuration and returns proposed changes for OpenEvolve to apply.
+Sampling parameters `temperature`, `top_p`, `max_tokens`, and generation seeding
+are unsupported. See the quickstart for installation, execution settings, and
+opt-in live tests.
+
+## OpenCode CLI provider
+
+Set `llm.provider: opencode_cli` with explicit OpenCode `provider/model` names.
+The [OpenCode CLI quickstart](../examples/opencode_cli_quickstart/) provides a
+10-iteration configuration with 30% GLM 5.3 (600-second timeout) and 70% GLM 5.3
+Flash (300-second timeout) through account-specific Modal endpoints. Replace
+these IDs with models available to your OpenCode account when needed.
+
+The provider uses saved OpenCode authentication and effective built-in or custom
+provider definitions, then isolates generation configuration. Model weights,
+system messages, timeouts, retries, retry delay, `temperature`, and `top_p` are
+supported. Optional `reasoning_effort` selects the provider-specific OpenCode
+`--variant`; omit it when a model has no applicable variant. `max_tokens` and
+generation seeding are unsupported. Configure provider endpoints and credentials
+in OpenCode; OpenEvolve's `api_base` and `api_key` are not forwarded. The quickstart
+documents installation, model discovery, token usage, and opt-in live tests.
+
 ## Island-Based Evolution Parameters
 
 The key new parameters for proper evolutionary diversity are:
@@ -75,3 +106,43 @@ evolve = OpenEvolve(
     config=config
 )
 ```
+
+## Antigravity ACP provider
+
+Set `llm.provider: antigravity_acp` with an explicit model name. The
+[ACP quickstart](../examples/antigravity_acp_quickstart/) uses Google's official
+server 1.3.0, personal Google OAuth, `gemini-3.8-flash-medium`, a 300-second timeout,
+and two retries. Install and authenticate with:
+
+```bash
+python -m openevolve.antigravity_acp install
+python -m openevolve.antigravity_acp login
+```
+
+`antigravity_acp_path` and `antigravity_acp_home` select an alternate executable
+and dedicated persistent profile. They can be set at `llm` level or per model;
+per-model values take precedence and survive worker serialization. Environment
+defaults are `OPENEVOLVE_ANTIGRAVITY_ACP_BIN` and `OPENEVOLVE_ANTIGRAVITY_ACP_HOME`.
+The quickstart documents the default paths and matching login options.
+
+The provider verifies a `finish`-only built-in tool filter, disables client tools,
+and rejects profile hooks, MCP configuration, and nonempty skill directories.
+Each attempt uses a new session and temporary workspace. Runtime authentication
+does not open a browser. Model weights, timeout, retries, retry delay, and system
+messages are supported. Omit `reasoning_effort`; the model slug selects effort.
+Sampling parameters, API credentials/base URLs, and other providers' budget/tool
+options are not forwarded. ACP context usage is not reported as per-call token
+usage or monetary cost.
+
+## Antigravity CLI provider
+
+Set `llm.provider: antigravity_cli` with an explicit model name. The
+[quickstart](../examples/antigravity_cli_quickstart/) uses
+`gemini-3.8-flash-medium`, a 300-second timeout, and two retries. Existing weights,
+reasoning effort, timeout, and retry settings work without an API key.
+
+AGY must confirm the requested generation-only agent and restricted tools in its
+initialization event. AGY 1.2.16 fails this check; the adapter sends no prompt and
+does not retry. The quickstart describes the limitation and the opt-in live test.
+Global AGY settings are not modified; CLI-managed history and startup integrations
+can still be used by AGY. Sampling parameters are not forwarded.
