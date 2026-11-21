@@ -54,7 +54,7 @@ def export_traces_json(
     Args:
         traces: List of trace objects with to_dict() method
         output_path: Path to save the JSON file
-        metadata: Optional metadata to include in the output
+        metadata: Optional metadata to include in the output, without modifying the caller's dict
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +68,7 @@ def export_traces_json(
             trace_dicts.append(trace)
 
     # Build output structure
-    output_data = {"metadata": metadata or {}, "traces": trace_dicts}
+    output_data = {"metadata": dict(metadata or {}), "traces": trace_dicts}
 
     # Add default metadata
     output_data["metadata"].setdefault("total_traces", len(trace_dicts))
@@ -78,6 +78,11 @@ def export_traces_json(
         json.dump(output_data, f, indent=2)
 
     logger.info(f"Exported {len(traces)} traces to {output_path}")
+
+
+# Names the metadata attributes that were JSON-encoded, so a list or dict can be told apart
+# from a string that merely looks like JSON
+_HDF5_JSON_KEYS_ATTR = "__json_encoded_keys__"
 
 
 def export_traces_hdf5(
@@ -107,12 +112,15 @@ def export_traces_hdf5(
         meta_group = f.create_group("metadata")
 
         # Add metadata
+        json_encoded_keys = []
         if metadata:
             for key, value in metadata.items():
                 if isinstance(value, (str, int, float, bool)):
                     meta_group.attrs[key] = value
                 else:
                     meta_group.attrs[key] = json.dumps(value)
+                    json_encoded_keys.append(key)
+        meta_group.attrs[_HDF5_JSON_KEYS_ATTR] = json.dumps(json_encoded_keys)
 
         meta_group.attrs["total_traces"] = len(traces)
         meta_group.attrs["exported_at"] = time.time()
@@ -252,10 +260,17 @@ def load_traces_hdf5(input_path: Union[str, Path]) -> tuple[List[Dict[str, Any]]
         # Load metadata
         if "metadata" in f:
             meta_group = f["metadata"]
+            json_encoded_keys = meta_group.attrs.get(_HDF5_JSON_KEYS_ATTR)
+            if json_encoded_keys is not None:
+                json_encoded_keys = set(json.loads(json_encoded_keys))
             for key in meta_group.attrs:
+                if key == _HDF5_JSON_KEYS_ATTR:
+                    continue
                 value = meta_group.attrs[key]
-                # Try to parse JSON strings
-                if isinstance(value, str) and value.startswith("{"):
+                if json_encoded_keys is not None:
+                    metadata[key] = json.loads(value) if key in json_encoded_keys else value
+                # Files without the key list can't tell JSON from a string that looks like it
+                elif isinstance(value, str) and value.startswith("{"):
                     try:
                         metadata[key] = json.loads(value)
                     except json.JSONDecodeError:

@@ -2,6 +2,7 @@
 Safe calculation utilities for metrics containing mixed types
 """
 
+import math
 from typing import Any, Dict, List, Optional
 
 
@@ -37,7 +38,13 @@ def safe_numeric_average(metrics: Dict[str, Any]) -> float:
     if not numeric_values:
         return 0.0
 
-    return sum(numeric_values) / len(numeric_values)
+    total = sum(numeric_values)
+    if not math.isfinite(total) and all(math.isfinite(value) for value in numeric_values):
+        # A finite average can still have an overflowing intermediate sum.
+        # Rescale only that case, retaining ordinary rounding and explicit infinities.
+        scale = max(abs(value) for value in numeric_values)
+        return (sum(value / scale for value in numeric_values) / len(numeric_values)) * scale
+    return total / len(numeric_values)
 
 
 def safe_numeric_sum(metrics: Dict[str, Any]) -> float:
@@ -83,7 +90,8 @@ def get_fitness_score(
         feature_dimensions: List of MAP-Elites dimensions to exclude from fitness
 
     Returns:
-        Fitness score (combined_score if available, otherwise average of non-feature metrics)
+        Fitness score (combined_score if available, otherwise average of non-feature metrics).
+        A NaN combined_score gives -inf, so that program ranks below every other.
     """
     if not metrics:
         return 0.0
@@ -91,7 +99,9 @@ def get_fitness_score(
     # Always prefer combined_score if available
     if "combined_score" in metrics:
         try:
-            return float(metrics["combined_score"])
+            combined_score = float(metrics["combined_score"])
+            # Every comparison with NaN is False, so a NaN score would never be beaten. Rank it last
+            return float("-inf") if math.isnan(combined_score) else combined_score
         except (ValueError, TypeError):
             pass
 

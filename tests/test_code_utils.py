@@ -9,14 +9,96 @@ from openevolve.utils.code_utils import (
     apply_diff,
     apply_diff_blocks,
     enforce_evolve_blocks,
+    extract_code_language,
     extract_diffs,
     format_diff_summary,
     parse_evolve_blocks,
+    parse_full_rewrite,
 )
 
 
 class TestCodeUtils(unittest.TestCase):
     """Tests for code utilities"""
+
+    def test_extract_code_language_java(self):
+        sources = [
+            "package demo;\nimport java.util.List;\npublic class Demo {}",
+            "import java.util.List;\npublic class Demo {}",
+            "import static java.util.Collections.emptyList;\npublic class Demo {}",
+            "public class Demo {}",
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(extract_code_language(source), "java")
+
+    def test_extract_code_language_python(self):
+        sources = [
+            "import os\nprint(os.getcwd())",
+            "from math import sqrt\nprint(sqrt(4))",
+            "def solve():\n    return 1",
+            "class Demo:\n    pass",
+            "import java",
+            "import java.util",
+            "import java_api",
+            "from java import util",
+            'import os\npackage = "demo"',
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(extract_code_language(source), "python")
+
+    def test_extract_code_language_other_signatures(self):
+        sources = [
+            ("#include <iostream>\nint main() { return 0; }", "cpp"),
+            ("function solve() { return 1; }", "javascript"),
+            ("fn main() {}", "rust"),
+            ("SELECT * FROM users;", "sql"),
+            ("42 + 7", "unknown"),
+        ]
+        for source, language in sources:
+            with self.subTest(language=language):
+                self.assertEqual(extract_code_language(source), language)
+
+    def test_parse_full_rewrite_line_endings(self):
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)):
+                code = f"def solve():{newline}    return 42"
+                response = f"Updated program:{newline}```python{newline}{code}{newline}```"
+                result = parse_full_rewrite(response)
+                self.assertEqual(result, code)
+                namespace = {}
+                exec(result, namespace)
+                self.assertEqual(namespace["solve"](), 42)
+
+    def test_parse_full_rewrite_literal_language(self):
+        response = "```c\nint wrong;\n```\n```c++\nint correct;\n```"
+        self.assertEqual(parse_full_rewrite(response, "c++"), "int correct;")
+
+    def test_parse_full_rewrite_horizontal_whitespace_after_language(self):
+        for whitespace in (" ", "\t", " \t"):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(whitespace=repr(whitespace), newline=repr(newline)):
+                    response = (
+                        f"```python{whitespace}{newline}"
+                        f"def run():{newline}    return 42{newline}```"
+                    )
+                    namespace = {}
+                    exec(parse_full_rewrite(response), namespace)
+                    self.assertEqual(namespace["run"](), 42)
+
+    def test_parse_full_rewrite_fallbacks(self):
+        for response in ("```\nx = 1\n```", "x = 1"):
+            with self.subTest(response=response):
+                self.assertEqual(parse_full_rewrite(response), "x = 1")
+
+    def test_parse_full_rewrite_other_language_tag(self):
+        for tag in ("py", "python3", "Python", "c++"):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(tag=tag, newline=repr(newline)):
+                    response = f"```{tag}{newline}x = 1{newline}```"
+                    self.assertEqual(parse_full_rewrite(response), "x = 1")
+        response = "```js\nconsole.log(1)\n```"
+        self.assertEqual(parse_full_rewrite(response, "javascript"), "console.log(1)")
 
     def test_extract_diffs(self):
         """Test extracting diffs from a response"""
@@ -195,12 +277,30 @@ class TestDiffDelimiterValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             extract_diffs(text)
 
-    def test_crlf_marker_is_recognised(self):
-        # Standard pattern needs LF after markers, so a CRLF response yields no
-        # match; its marker lines are then reported rather than silently ignored.
+    def test_crlf_response_is_parsed(self):
         text = "<<<<<<< SEARCH\r\nx = 1\r\n=======\r\nx = 2\r\n>>>>>>> REPLACE\r\n"
-        with self.assertRaises(ValueError):
-            extract_diffs(text)
+        self.assertEqual(extract_diffs(text), [("x = 1", "x = 2")])
+        self.assertEqual(apply_diff("x = 1\ny = 1", text), "x = 2\ny = 1")
+
+    def test_multiline_response_uses_logical_lines(self):
+        search = "x = 1\ny = 2"
+        replacement = "x = 3\ny = 4"
+        near_match = "x = 1  \ny = 2"
+        original = f"{near_match}\n\n{search}\nz = x + y\n"
+        expected = f"{near_match}\n\n{replacement}\nz = x + y\n"
+        diff = f"<<<<<<< SEARCH\n{search}\n=======\n{replacement}\n>>>>>>> REPLACE\n"
+
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)):
+                response = diff.replace("\n", newline)
+                blocks = extract_diffs(response)
+                self.assertEqual(blocks, [(search, replacement)])
+                self.assertEqual(apply_diff(original, response), expected)
+                self.assertEqual(apply_diff_blocks(original, blocks), (expected, 1))
+
+    def test_marker_lines_with_trailing_whitespace_are_parsed(self):
+        text = "<<<<<<< SEARCH  \nx = 1\n=======\t\nx = 2\n>>>>>>> REPLACE \n"
+        self.assertEqual(extract_diffs(text), [("x = 1", "x = 2")])
 
     def test_apply_diff_leaves_no_partial_changes(self):
         # A valid first block must not be applied when a later block is malformed.
@@ -223,6 +323,22 @@ class TestDiffDelimiterValidation(unittest.TestCase):
         replace = "print('=======')\n# ======= section\nsep = '=' * 7"
         text = f"<<<<<<< SEARCH\nx = 1\n=======\n{replace}\n>>>>>>> REPLACE\n"
         self.assertEqual(extract_diffs(text), [("x = 1", replace)])
+
+    def test_code_line_ending_in_separator_does_not_split_search(self):
+        # A banner comment such as "# =====" ends with the separator text; only a
+        # line that is the separator ends the SEARCH section.
+        banner = "# " + "=" * 25
+        search = f"{banner}\n# Helpers\n{banner}\ndef f(x):\n    return x + 1"
+        replace = f"{banner}\n# Helpers\n{banner}\ndef f(x):\n    return x + 2"
+        text = f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+        self.assertEqual(extract_diffs(text), [(search, replace)])
+        self.assertEqual(apply_diff(search + "\n", text), replace + "\n")
+
+    def test_code_line_ending_in_marker_text_is_not_a_marker(self):
+        search = "x = 1  # <<<<<<< SEARCH"
+        replace = "x = 2  # >>>>>>> REPLACE"
+        text = f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+        self.assertEqual(extract_diffs(text), [(search, replace)])
 
     def test_marker_words_in_prose_are_allowed(self):
         text = (

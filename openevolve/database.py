@@ -12,7 +12,7 @@ import shutil
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from numbers import Integral
 from types import MappingProxyType
 
@@ -30,7 +30,7 @@ from openevolve.population import (
     ProgramState,
 )
 from openevolve.utils.code_utils import calculate_edit_distance
-from openevolve.utils.metrics_utils import safe_numeric_average, get_fitness_score
+from openevolve.utils.metrics_utils import get_fitness_score, safe_numeric_average
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,29 @@ def _safe_avg_metrics(metrics: Dict[str, Any]) -> float:
         v for v in metrics.values() if isinstance(v, (int, float)) and not isinstance(v, bool)
     ]
     return sum(numeric_values) / max(1, len(numeric_values)) if numeric_values else 0.0
+
+
+def _copy_field_value(value: Any) -> Any:
+    """
+    Produce the same value dataclasses.asdict() would produce for one field.
+
+    asdict() walks every node through _asdict_inner() and copy.deepcopy(), which is
+    a large amount of dispatch for the plain str/int/float/dict/list values a Program
+    actually holds. The fast paths below cover those; anything else falls back to the
+    same helpers asdict() itself would use, so the result is unchanged.
+    """
+    t = type(value)
+    if t is str or t is int or t is float or t is bool or value is None:
+        return value
+    if t is dict:
+        return {k: _copy_field_value(v) for k, v in value.items()}
+    if t is list:
+        return [_copy_field_value(v) for v in value]
+    if t is tuple:
+        return tuple(_copy_field_value(v) for v in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    return copy.deepcopy(value)
 
 
 @dataclass
@@ -101,7 +124,8 @@ class Program:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation"""
-        return asdict(self)
+        values = self.__dict__
+        return {name: _copy_field_value(values[name]) for name in _PROGRAM_FIELD_NAMES}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Program":
@@ -133,6 +157,11 @@ class Program:
         return cls(**filtered_data)
 
 
+# Field order of Program, resolved once. to_dict() walks this instead of calling
+# dataclasses.fields() on every call.
+_PROGRAM_FIELD_NAMES = tuple(f.name for f in fields(Program))
+
+
 class ProgramDatabase:
     """
     Database for storing and sampling programs during evolution
@@ -142,11 +171,20 @@ class ProgramDatabase:
     It also tracks the absolute best program separately to ensure it's never lost.
     """
 
+    # Bound on _code_shape_cache. A class attribute rather than an instance one so it
+    # is available to _fast_code_diversity from inside __init__ itself.
+    _CODE_SHAPE_CACHE_SIZE = 2048
+
     def __init__(
         self, config: DatabaseConfig, population_strategy: Optional[PopulationStrategy] = None
     ):
         self.config = config
         self.population_strategy = population_strategy
+
+        # Bound before anything else in __init__: load() below reaches
+        # log_island_status() -> get_island_stats() -> _calculate_island_diversity()
+        # -> _fast_code_diversity(), which needs this cache.
+        self._code_shape_cache: Dict[str, Tuple[int, int, frozenset]] = {}
 
         # In-memory program storage
         self.programs: Dict[str, Program] = {}
@@ -186,6 +224,9 @@ class ProgramDatabase:
         # Track the last iteration number (for resuming)
         self.last_iteration: int = 0
 
+        # Initialize before loading so restored MAP-Elites scales are retained.
+        self.feature_stats: Dict[str, Dict[str, Union[float, float, List[float]]]] = {}
+
         # Load database from disk if path is provided
         if config.db_path and os.path.exists(config.db_path):
             self.load(config.db_path)
@@ -211,7 +252,6 @@ class ProgramDatabase:
         self.diversity_reference_size: int = getattr(config, "diversity_reference_size", 20)
 
         # Feature scaling infrastructure
-        self.feature_stats: Dict[str, Dict[str, Union[float, float, List[float]]]] = {}
         self.feature_scaling_method: str = "minmax"  # Options: minmax, zscore, percentile
 
         # Per-dimension bins support
@@ -279,7 +319,8 @@ class ProgramDatabase:
             target_island: Specific island to add to (auto-detects parent's island if None)
 
         Returns:
-            Program ID, or None when the admission strategy rejects the candidate
+            Program ID, or None when the admission strategy or the novelty check
+            rejects the candidate
         """
         if self.population_strategy is None or not any(
             (
@@ -380,17 +421,25 @@ class ProgramDatabase:
         if iteration is not None:
             program.iteration_found = iteration
             self.last_iteration = max(self.last_iteration, iteration)
+        previous_entry = self.programs.get(program.id)
         self.programs[program.id] = program
-
-        # Calculate feature coordinates for MAP-Elites
-        feature_coords = self._calculate_feature_coords(program)
 
         # Novelty check before adding
         if not self._is_novel(program.id, island_idx):
             logger.debug(
                 f"Program {program.id} failed in novelty check and won't be added in the island {island_idx}"
             )
-            return program.id  # Do not add non-novel program
+            # Undo the provisional store so the rejected program cannot be sampled,
+            # counted against the population limit, or saved to checkpoints.
+            if previous_entry is None:
+                del self.programs[program.id]
+            else:
+                self.programs[program.id] = previous_entry
+            return None
+
+        # Calculate feature coordinates for MAP-Elites (after the novelty check so
+        # rejected programs do not widen the feature scaling ranges)
+        feature_coords = self._calculate_feature_coords(program)
 
         # Add to island-specific feature map (replacing existing if better)
         feature_key = self._feature_coords_to_key(feature_coords)
@@ -854,6 +903,11 @@ class ProgramDatabase:
         num_islands = max(len(saved_islands), self.config.num_islands)
         self.islands = [set() for _ in range(num_islands)]
 
+        # Retain saved cells and initialize maps for any newly configured islands.
+        self.island_feature_maps.extend(
+            {} for _ in range(num_islands - len(self.island_feature_maps))
+        )
+
         missing_programs = []
         restored_programs = 0
 
@@ -1136,6 +1190,7 @@ class ProgramDatabase:
         Use LLM to judge if a program is novel compared to a similar existing program
         """
         import asyncio
+
         from openevolve.novelty_judge import NOVELTY_SYSTEM_MSG, NOVELTY_USER_MSG
 
         user_msg = NOVELTY_USER_MSG.format(
@@ -1791,7 +1846,7 @@ class ProgramDatabase:
                 inspirations.append(program)
 
         # Add diverse programs from within the island
-        if len(island_programs) > n and len(inspirations) < n:
+        if len(inspirations) < n:
             remaining_slots = n - len(inspirations)
 
             # Try to sample from different feature cells within the island
@@ -1811,8 +1866,14 @@ class ProgramDatabase:
             for _ in range(remaining_slots * 3):  # Try more times to find nearby programs
                 # Perturb coordinates
                 perturbed_coords = [
-                    max(0, min(self.feature_bins - 1, c + random.randint(-2, 2)))
-                    for c in feature_coords
+                    max(
+                        0,
+                        min(
+                            self.feature_bins_per_dim.get(dim, self.feature_bins) - 1,
+                            c + random.randint(-2, 2),
+                        ),
+                    )
+                    for dim, c in zip(self.config.feature_dimensions, feature_coords)
                 ]
 
                 cell_key = self._feature_coords_to_key(perturbed_coords)
@@ -2069,12 +2130,18 @@ class ProgramDatabase:
             self._validate_migration_results()
             return
 
+        # Choose every island's migrants from the population before this round. Choosing them
+        # while migrating lets an island's top slots go to copies it has just received (which
+        # _migrate_one skips), and lets those copies displace its own programs from their cells
+        # before they get the chance to migrate.
+        planned_moves = []
         for i, island in enumerate(self.islands):
-            if len(island) == 0:
-                continue
-
-            # Select top programs from this island for migration
-            island_programs = [self.programs[pid] for pid in island if pid in self.programs]
+            # Migrant copies are never migrated again, so they must not take migration slots
+            island_programs = [
+                self.programs[pid]
+                for pid in island
+                if pid in self.programs and not self.programs[pid].metadata.get("migrant", False)
+            ]
             if not island_programs:
                 continue
 
@@ -2093,7 +2160,10 @@ class ProgramDatabase:
 
             for migrant in migrants:
                 for target_island in target_islands:
-                    self._migrate_one(migrant.id, target_island)
+                    planned_moves.append((migrant.id, target_island))
+
+        for program_id, target_island in planned_moves:
+            self._migrate_one(program_id, target_island)
 
         # Update last migration generation
         self.last_migration_generation = max(self.island_generations)
@@ -2290,6 +2360,24 @@ class ProgramDatabase:
 
         return total_diversity / max(1, comparisons)
 
+    def _code_shape(self, code: str) -> Tuple[int, int, frozenset]:
+        """
+        Length, newline count and character set of one code string, memoized.
+
+        _get_cached_diversity() compares one program against the whole reference set,
+        so the same reference strings are re-scanned once per comparison, and the
+        program's own string is re-scanned once per reference entry. Each scan is
+        O(len(code)); the derived values only depend on the string itself.
+        """
+        shape = self._code_shape_cache.get(code)
+        if shape is None:
+            shape = (len(code), code.count("\n"), frozenset(code))
+            if len(self._code_shape_cache) >= self._CODE_SHAPE_CACHE_SIZE:
+                # Same insertion-order eviction the diversity cache uses
+                del self._code_shape_cache[next(iter(self._code_shape_cache))]
+            self._code_shape_cache[code] = shape
+        return shape
+
     def _fast_code_diversity(self, code1: str, code2: str) -> float:
         """
         Fast approximation of code diversity using simple metrics
@@ -2299,18 +2387,16 @@ class ProgramDatabase:
         if code1 == code2:
             return 0.0
 
+        len1, lines1, chars1 = self._code_shape(code1)
+        len2, lines2, chars2 = self._code_shape(code2)
+
         # Length difference (scaled to reasonable range)
-        len1, len2 = len(code1), len(code2)
         length_diff = abs(len1 - len2)
 
         # Line count difference
-        lines1 = code1.count("\n")
-        lines2 = code2.count("\n")
         line_diff = abs(lines1 - lines2)
 
         # Simple character set difference
-        chars1 = set(code1)
-        chars2 = set(code2)
         char_diff = len(chars1.symmetric_difference(chars2))
 
         # Combine metrics (scaled to match original edit distance range)
@@ -2404,9 +2490,10 @@ class ProgramDatabase:
         """Cache a diversity value with LRU eviction"""
         # Check if cache is full
         if len(self.diversity_cache) >= self.diversity_cache_size:
-            # Remove oldest entry
-            oldest_hash = min(self.diversity_cache.items(), key=lambda x: x[1]["timestamp"])[0]
-            del self.diversity_cache[oldest_hash]
+            # Remove oldest entry. Entries are inserted in increasing timestamp order
+            # and dicts preserve insertion order, so the first key is the same entry
+            # the previous min()-over-timestamps scan selected, without the O(n) scan.
+            del self.diversity_cache[next(iter(self.diversity_cache))]
 
         # Add new entry
         self.diversity_cache[code_hash] = {"value": diversity, "timestamp": time.time()}
@@ -2437,9 +2524,13 @@ class ProgramDatabase:
         stats["max"] = max(stats["max"], value)
 
         # Keep recent values for more sophisticated scaling methods
-        stats["values"].append(value)
-        if len(stats["values"]) > 1000:  # Limit memory usage
-            stats["values"] = stats["values"][-1000:]
+        values = stats["values"]
+        values.append(value)
+        if len(values) > 1000:  # Limit memory usage
+            # The list is trimmed one element at a time, so dropping the head in place
+            # is the same window the [-1000:] slice produced, without allocating and
+            # copying a fresh 1000-element list on every call once the window is full.
+            del values[0]
 
     def _scale_feature_value(self, feature_name: str, value: float) -> float:
         """
@@ -2786,7 +2877,7 @@ class ProgramDatabase:
         program_id: str,
         template_key: str,
         prompt: Dict[str, Any],
-        responses: Optional[List[str]] = None,
+        responses: Optional[List[Optional[str]]] = None,
         token_usage: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
@@ -2798,6 +2889,7 @@ class ProgramDatabase:
         template_key: Key for the prompt template
         prompt: Prompts in the format {template_key: { 'system': str, 'user': str }}.
         responses: Optional list of responses to the prompt, if available.
+            A None entry marks a disabled model that was not called.
         token_usage: Optional token usage dictionary for this LLM call.
         """
 

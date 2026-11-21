@@ -6,21 +6,57 @@ import asyncio
 import logging
 import multiprocessing as mp
 import pickle
+import random
 import signal
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from numbers import Integral
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
+from openevolve.llm.ensemble import add_usage, take_usage
 from openevolve.selection import IslandSelectionContext, IslandSelector, IslandState
 from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
+
+_worker_event_loop = None
+
+
+def _close_worker_event_loop():
+    """Release the worker's loop on orderly process exit."""
+    global _worker_event_loop
+    loop = _worker_event_loop
+    _worker_event_loop = None
+    if loop is not None and not loop.is_closed():
+        try:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+
+def _run_worker_async(coroutine):
+    """Keep cached async clients on one loop for the lifetime of a worker."""
+    global _worker_event_loop
+    if _worker_event_loop is None:
+        from multiprocessing.util import Finalize
+
+        _worker_event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_event_loop)
+        Finalize(None, _close_worker_event_loop, exitpriority=10)
+    return _worker_event_loop.run_until_complete(coroutine)
 
 
 class _CandidateRejected(Exception):
@@ -41,6 +77,36 @@ class SerializableResult:
     error: Optional[str] = None
     target_island: Optional[int] = None  # Island where child should be placed
     token_usage: Optional[Dict[str, Any]] = None
+    # "diff" or "full_rewrite": the mode this iteration prompted and parsed with
+    evolution_mode: Optional[str] = None
+
+
+EVOLUTION_MODE_DIFF = "diff"
+EVOLUTION_MODE_FULL_REWRITE = "full_rewrite"
+
+
+def _choose_evolution_mode(config: Config, iteration: int) -> str:
+    """Pick diff or full rewrite for one iteration.
+
+    With random_seed set, the choice is seeded from the seed and the iteration, so it does not
+    depend on which worker runs the iteration and does not disturb other random draws"""
+    if not config.diff_based_evolution:
+        return EVOLUTION_MODE_FULL_REWRITE
+    p = config.full_rewrite_probability
+    if p <= 0:
+        return EVOLUTION_MODE_DIFF
+    if p >= 1:
+        return EVOLUTION_MODE_FULL_REWRITE
+    if config.random_seed is not None:
+        rng = random.Random(f"{config.random_seed}:{iteration}:evolution_mode")
+    else:
+        rng = random.Random()
+    return EVOLUTION_MODE_FULL_REWRITE if rng.random() < p else EVOLUTION_MODE_DIFF
+
+
+def _prompt_template_key(evolution_mode: Optional[str]) -> str:
+    """The user template an iteration in `evolution_mode` was prompted with"""
+    return "full_rewrite_user" if evolution_mode == EVOLUTION_MODE_FULL_REWRITE else "diff_user"
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -56,6 +122,10 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     global _worker_evaluator
     global _worker_llm_ensemble
     global _worker_prompt_sampler
+    global _worker_event_loop
+
+    # A forked worker must not inherit a loop owned by the parent process.
+    _worker_event_loop = None
 
     # Store config for later use
     # Reconstruct Config object from nested dictionaries
@@ -63,6 +133,7 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
         Config,
         DatabaseConfig,
         EvaluatorConfig,
+        EvolutionTraceConfig,
         LLMConfig,
         LLMModelConfig,
         PromptConfig,
@@ -82,16 +153,18 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     prompt_config = PromptConfig(**config_dict["prompt"])
     database_config = DatabaseConfig(**config_dict["database"])
     evaluator_config = EvaluatorConfig(**config_dict["evaluator"])
+    evolution_trace_config = EvolutionTraceConfig(**config_dict["evolution_trace"])
 
     _worker_config = Config(
         llm=llm_config,
         prompt=prompt_config,
         database=database_config,
         evaluator=evaluator_config,
+        evolution_trace=evolution_trace_config,
         **{
             k: v
             for k, v in config_dict.items()
-            if k not in ["llm", "prompt", "database", "evaluator"]
+            if k not in ["llm", "prompt", "database", "evaluator", "evolution_trace"]
         },
     )
     _worker_evaluation_file = evaluation_file
@@ -143,8 +216,29 @@ def _run_iteration_worker(
 ) -> SerializableResult:
     """Run a single iteration in a worker process"""
     try:
+        evolution_mode = _choose_evolution_mode(_worker_config, iteration)
+    except Exception as e:
+        logger.exception(f"Error choosing evolution mode in worker iteration {iteration}")
+        return SerializableResult(error=str(e), iteration=iteration)
+    result = _run_iteration(iteration, db_snapshot, parent_id, inspiration_ids, evolution_mode)
+    # Recorded on failures too, so parse/compile failure rates can be compared per mode
+    result.evolution_mode = evolution_mode
+    return result
+
+
+def _run_iteration(
+    iteration: int,
+    db_snapshot: Dict[str, Any],
+    parent_id: str,
+    inspiration_ids: List[str],
+    evolution_mode: str,
+) -> SerializableResult:
+    """Run one iteration, prompting and parsing as `evolution_mode` says"""
+    diff_based = evolution_mode == EVOLUTION_MODE_DIFF
+    try:
         # Lazy initialization
         _lazy_init_worker_components()
+        _worker_llm_ensemble.reseed(iteration)
 
         # Reconstruct programs from snapshot
         programs = {pid: Program(**prog_dict) for pid, prog_dict in db_snapshot["programs"].items()}
@@ -194,7 +288,7 @@ def _run_iteration_worker(
             inspirations=[p.to_dict() for p in inspirations],
             language=_worker_config.language,
             evolution_round=iteration,
-            diff_based_evolution=_worker_config.diff_based_evolution,
+            diff_based_evolution=diff_based,
             program_artifacts=parent_artifacts,
             feature_dimensions=db_snapshot.get("feature_dimensions", []),
             current_changes_description=parent_changes_desc,
@@ -202,10 +296,26 @@ def _run_iteration_worker(
         )
 
         iteration_start = time.time()
+        llm_response = None
+        token_usage = None
+
+        def _reject(error: str) -> SerializableResult:
+            """A failed iteration that still carries what the LLM was asked and answered"""
+            if token_usage and token_usage.get("finish_reason") == "length":
+                error += " (response was cut off at llm.max_tokens)"
+            return SerializableResult(
+                error=error,
+                iteration=iteration,
+                token_usage=token_usage,
+                prompt=prompt,
+                llm_response=llm_response,
+                parent_id=parent.id,
+                target_island=db_snapshot.get("sampling_island"),
+            )
 
         # Generate code modification (sync wrapper for async)
         try:
-            llm_response = asyncio.run(
+            llm_response = _run_worker_async(
                 _worker_llm_ensemble.generate_with_context(
                     system_message=prompt["system"],
                     messages=[{"role": "user", "content": prompt["user"]}],
@@ -214,16 +324,14 @@ def _run_iteration_worker(
             token_usage = getattr(_worker_llm_ensemble, "last_usage", None)
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
-            return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
+            return _reject(error=f"LLM generation failed: {str(e)}")
 
         # Check for None response
         if llm_response is None:
-            return SerializableResult(
-                error="LLM returned None response", iteration=iteration, token_usage=token_usage
-            )
+            return _reject(error="LLM returned None response")
 
         # Parse response based on evolution mode
-        if _worker_config.diff_based_evolution:
+        if diff_based:
             from openevolve.utils.code_utils import (
                 apply_diff_blocks,
                 extract_diffs,
@@ -234,15 +342,9 @@ def _run_iteration_worker(
             try:
                 diff_blocks = extract_diffs(llm_response, _worker_config.diff_pattern)
             except ValueError as exc:
-                return SerializableResult(
-                    error=str(exc), iteration=iteration, token_usage=token_usage
-                )
+                return _reject(error=str(exc))
             if not diff_blocks:
-                return SerializableResult(
-                    error="No valid diffs found in response",
-                    iteration=iteration,
-                    token_usage=token_usage,
-                )
+                return _reject(error="No valid diffs found in response")
 
             if _worker_config.prompt.programs_as_changes_description:
                 try:
@@ -252,9 +354,7 @@ def _run_iteration_worker(
                         changes_description_text=parent_changes_desc,
                     )
                 except Exception as e:
-                    return SerializableResult(
-                        error=str(e), iteration=iteration, token_usage=token_usage
-                    )
+                    return _reject(error=str(e))
 
                 child_code, _ = apply_diff_blocks(parent.code, code_blocks)
                 child_changes_desc, desc_applied = apply_diff_blocks(
@@ -267,10 +367,8 @@ def _run_iteration_worker(
                     or not child_changes_desc.strip()
                     or child_changes_desc.strip() == parent_changes_desc.strip()
                 ):
-                    return SerializableResult(
-                        error="changes_description was not updated or empty, program is discarded",
-                        iteration=iteration,
-                        token_usage=token_usage,
+                    return _reject(
+                        error="changes_description was not updated or empty, program is discarded"
                     )
 
                 changes_summary = format_diff_summary(
@@ -282,13 +380,11 @@ def _run_iteration_worker(
                 # All diffs applied only to code
                 child_code, applied = apply_diff_blocks(parent.code, diff_blocks)
                 if applied == 0:
-                    return SerializableResult(
+                    return _reject(
                         error=(
                             f"None of the {len(diff_blocks)} SEARCH block(s) matched the "
                             "parent program"
                         ),
-                        iteration=iteration,
-                        token_usage=token_usage,
                     )
                 if applied < len(diff_blocks):
                     logger.warning(
@@ -296,11 +392,7 @@ def _run_iteration_worker(
                         "SEARCH block(s) matched the parent program"
                     )
                 if child_code == parent.code:
-                    return SerializableResult(
-                        error="Diff did not change the parent program",
-                        iteration=iteration,
-                        token_usage=token_usage,
-                    )
+                    return _reject(error="Diff did not change the parent program")
                 changes_summary = format_diff_summary(
                     diff_blocks,
                     max_line_len=_worker_config.prompt.diff_summary_max_line_len,
@@ -311,18 +403,10 @@ def _run_iteration_worker(
 
             new_code = parse_full_rewrite(llm_response, _worker_config.language)
             if not new_code:
-                return SerializableResult(
-                    error=f"No valid code found in response",
-                    iteration=iteration,
-                    token_usage=token_usage,
-                )
+                return _reject(error=f"No valid code found in response")
 
             if new_code == parent.code:
-                return SerializableResult(
-                    error="Rewrite is identical to the parent program",
-                    iteration=iteration,
-                    token_usage=token_usage,
-                )
+                return _reject(error="Rewrite is identical to the parent program")
 
             child_code = new_code
             changes_summary = "Full rewrite"
@@ -334,34 +418,29 @@ def _run_iteration_worker(
             try:
                 enforced_code = enforce_evolve_blocks(parent.code, child_code)
             except ValueError as exc:
-                return SerializableResult(
-                    error=str(exc), iteration=iteration, token_usage=token_usage
-                )
+                return _reject(error=str(exc))
             if enforced_code != child_code:
                 logger.info(
                     f"Iteration {iteration}: reverted edits outside the EVOLVE-BLOCK regions"
                 )
                 child_code = enforced_code
                 if child_code == parent.code:
-                    return SerializableResult(
-                        error="All edits were outside the EVOLVE-BLOCK regions",
-                        iteration=iteration,
-                        token_usage=token_usage,
-                    )
+                    return _reject(error="All edits were outside the EVOLVE-BLOCK regions")
 
         # Check code length
         if len(child_code) > _worker_config.max_code_length:
-            return SerializableResult(
-                error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
-                iteration=iteration,
-                token_usage=token_usage,
+            return _reject(
+                error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})"
             )
 
         # Evaluate the child program
         import uuid
 
         child_id = str(uuid.uuid4())
-        child_metrics = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
+        child_metrics = _run_worker_async(_worker_evaluator.evaluate_program(child_code, child_id))
+        # The evaluator's own LLM calls (use_llm_feedback) are part of this iteration's usage
+        evaluator_llm = getattr(_worker_evaluator, "llm_ensemble", None)
+        token_usage = add_usage(token_usage, take_usage(evaluator_llm))
 
         # Get artifacts
         artifacts = _worker_evaluator.get_pending_artifacts(child_id)
@@ -381,6 +460,8 @@ def _run_iteration_worker(
                 "parent_metrics": parent.metrics,
                 "island": parent_island,
                 "token_usage": token_usage,
+                "evolution_mode": evolution_mode,
+                "llm_model": getattr(_worker_llm_ensemble, "last_model", None),
             },
         )
 
@@ -484,6 +565,14 @@ class ProcessParallelController:
         self.shutdown_event = mp.Event()
         self.early_stopping_triggered = False
 
+        # Per-run outcome counters, reset by run_evolution (issue #288)
+        self.completed_iterations = 0
+        self.successful_iterations = 0
+        self.last_iteration_error: Optional[str] = None
+        # True when the last run completed iterations but every one of them failed
+        # before producing a candidate program
+        self.produced_no_candidates = False
+
         # Number of worker processes
         self.num_workers = config.evaluator.parallel_evaluations
         self.num_islands = config.database.num_islands
@@ -496,6 +585,13 @@ class ProcessParallelController:
 
         # The asdict() call itself triggers the deepcopy which tries to serialize novelty_llm. Remove it first.
         config.database.novelty_llm = None
+
+        # Forward every remaining top-level field automatically. Listing them by hand
+        # let new fields fall back to their defaults in workers (issue #516)
+        nested_sections = {"llm", "prompt", "database", "evaluator", "evolution_trace"}
+        top_level = {
+            f.name: getattr(config, f.name) for f in fields(Config) if f.name not in nested_sections
+        }
 
         return {
             "llm": {
@@ -513,14 +609,8 @@ class ProcessParallelController:
             "prompt": asdict(config.prompt),
             "database": asdict(config.database),
             "evaluator": asdict(config.evaluator),
-            "max_iterations": config.max_iterations,
-            "checkpoint_interval": config.checkpoint_interval,
-            "log_level": config.log_level,
-            "log_dir": config.log_dir,
-            "random_seed": config.random_seed,
-            "diff_based_evolution": config.diff_based_evolution,
-            "max_code_length": config.max_code_length,
-            "language": config.language,
+            "evolution_trace": asdict(config.evolution_trace),
+            **top_level,
             "file_suffix": self.file_suffix,
         }
 
@@ -630,12 +720,21 @@ class ProcessParallelController:
             )
         return int(island_id)
 
-    def _checkpoint_if_due(self, iteration: int, callback=None) -> None:
-        if iteration > 0 and iteration % self.config.checkpoint_interval == 0:
+    def _checkpoint_if_due(self, iteration: int, callback=None, is_new_best: bool = False) -> None:
+        # Don't checkpoint at iteration 0 (that's just the initial program)
+        if iteration <= 0:
+            return
+        interval_hit = iteration % self.config.checkpoint_interval == 0
+        improvement_hit = self.config.checkpoint_on_improvement and is_new_best
+        if not (interval_hit or improvement_hit):
+            return
+        if interval_hit:
             logger.info("Checkpoint interval reached at iteration %d", iteration)
-            self.database.log_island_status()
-            if callback:
-                callback(iteration)
+        else:
+            logger.info("Checkpointing new best solution at iteration %d", iteration)
+        self.database.log_island_status()
+        if callback:
+            callback(iteration)
 
     async def run_evolution(
         self,
@@ -687,6 +786,10 @@ class ProcessParallelController:
 
         next_iteration = current_iteration
         completed_iterations = 0
+        # Iterations whose worker produced a candidate program. A run where this
+        # stays at zero (e.g. the LLM endpoint is down) made no progress at all.
+        successful_iterations = 0
+        self.last_iteration_error = None
         total_prompt_tokens = 0
         total_completion_tokens = 0
         total_tokens = 0
@@ -737,21 +840,37 @@ class ProcessParallelController:
                 result = future.result(timeout=timeout_seconds)
 
                 token_str = ""
-                if result.token_usage:
+                if isinstance(result.token_usage, dict):
                     pt = result.token_usage.get("prompt_tokens", 0)
                     ct = result.token_usage.get("completion_tokens", 0)
                     tt = result.token_usage.get("total_tokens", 0)
                     total_prompt_tokens += pt
                     total_completion_tokens += ct
                     total_tokens += tt
-                    total_llm_calls += 1
+                    total_llm_calls += result.token_usage.get("calls", 1)
                     token_str = f" | tokens: {tt} (prompt: {pt}, completion: {ct})"
 
                 if result.error:
+                    self.last_iteration_error = result.error
+                    mode_str = f" [{result.evolution_mode}]" if result.evolution_mode else ""
                     logger.warning(
-                        f"Iteration {completed_iteration} error: {result.error}{token_str}"
+                        f"Iteration {completed_iteration} error{mode_str}: "
+                        f"{result.error}{token_str}"
                     )
+                    if self.evolution_tracer:
+                        self.evolution_tracer.log_failure(
+                            iteration=completed_iteration,
+                            error=result.error,
+                            parent_id=result.parent_id,
+                            evolution_mode=result.evolution_mode,
+                            prompt=result.prompt,
+                            llm_response=result.llm_response,
+                            token_usage=result.token_usage,
+                            island_id=result.target_island,
+                        )
                 elif result.child_program_dict:
+                    successful_iterations += 1
+
                     # Reconstruct program from dict
                     child_program = Program(**result.child_program_dict)
 
@@ -763,6 +882,13 @@ class ProcessParallelController:
                         iteration=completed_iteration,
                         target_island=result.target_island,
                     )
+                    # The novelty judge calls its LLM inside add(), in this process
+                    novelty_usage = take_usage(getattr(self.database, "novelty_llm", None))
+                    if novelty_usage:
+                        total_prompt_tokens += novelty_usage["prompt_tokens"]
+                        total_completion_tokens += novelty_usage["completion_tokens"]
+                        total_tokens += novelty_usage["total_tokens"]
+                        total_llm_calls += novelty_usage["calls"]
                     if admitted_id is None:
                         raise _CandidateRejected(child_program.id)
 
@@ -776,6 +902,16 @@ class ProcessParallelController:
                         parent_program = (
                             self.database.get(result.parent_id) if result.parent_id else None
                         )
+                        if parent_program is None and result.parent_id:
+                            # The parent can leave the archive (replaced in its MAP-Elites
+                            # cell) while its child is being evaluated. Trace the child
+                            # anyway, from the parent metrics the worker saw; its code is gone
+                            parent_program = SimpleNamespace(
+                                id=result.parent_id,
+                                code=None,
+                                metrics=child_program.metadata.get("parent_metrics") or {},
+                                changes_description=None,
+                            )
                         if parent_program:
                             # Determine island ID
                             island_id = child_program.metadata.get(
@@ -794,17 +930,15 @@ class ProcessParallelController:
                                     "iteration_time": result.iteration_time,
                                     "changes": child_program.metadata.get("changes", ""),
                                     "token_usage": result.token_usage,
+                                    "evolution_mode": result.evolution_mode,
+                                    "llm_model": child_program.metadata.get("llm_model"),
                                 },
                             )
 
                     # Log prompts
                     if result.prompt:
                         self.database.log_prompt(
-                            template_key=(
-                                "full_rewrite_user"
-                                if not self.config.diff_based_evolution
-                                else "diff_user"
-                            ),
+                            template_key=_prompt_template_key(result.evolution_mode),
                             program_id=child_program.id,
                             prompt=result.prompt,
                             responses=[result.llm_response] if result.llm_response else [],
@@ -858,13 +992,16 @@ class ProcessParallelController:
                             self._warned_about_combined_score = True
 
                     # Check for new best
-                    if self.database.best_program_id == child_program.id:
+                    is_new_best = self.database.best_program_id == child_program.id
+                    if is_new_best:
                         logger.info(
                             f"🌟 New best solution found at iteration {completed_iteration}: "
                             f"{child_program.id}"
                         )
 
-                    self._checkpoint_if_due(completed_iteration, checkpoint_callback)
+                    self._checkpoint_if_due(
+                        completed_iteration, checkpoint_callback, is_new_best=is_new_best
+                    )
 
                     # Check target score
                     if target_score is not None and child_program.metrics:
@@ -879,62 +1016,86 @@ class ProcessParallelController:
 
                     # Check early stopping
                     if early_stopping_enabled and child_program.metrics:
-                        # Get the metric to track for early stopping
-                        current_score = None
-                        if self.config.early_stopping_metric in child_program.metrics:
-                            current_score = child_program.metrics[self.config.early_stopping_metric]
-                        elif self.config.early_stopping_metric == "combined_score":
-                            # Default metric not found, use safe average (standard pattern)
-                            current_score = safe_numeric_average(child_program.metrics)
-                        else:
-                            # User specified a custom metric that doesn't exist
-                            logger.warning(
-                                f"Early stopping metric '{self.config.early_stopping_metric}' not found, using safe numeric average"
+                        if child_program.metrics.get(
+                            "error"
+                        ) is not None or child_program.metrics.get("timeout"):
+                            # Failed or timed-out evaluations carry no score. Letting them
+                            # into the counter below would poison the best-score baseline
+                            # with 0.0 on the first failure and then count every subsequent
+                            # failure as "no improvement", so a run that never succeeded
+                            # once would exit through the successful-plateau path
+                            # (issue #294). Skip them: early stopping only counts
+                            # evaluations that actually produced a score. The "error" check
+                            # is presence-based (is not None) because evaluators signal
+                            # failures both with numeric ({"error": 0.0}) and string values.
+                            logger.debug(
+                                "Skipping failed evaluation from early stopping count at iteration %s",
+                                completed_iteration,
                             )
-                            current_score = safe_numeric_average(child_program.metrics)
-
-                        if current_score is not None and isinstance(current_score, (int, float)):
-                            # Check for improvement
-                            if self.config.early_stopping_patience > 0:
-                                improvement = current_score - best_score
-                                if improvement >= self.config.convergence_threshold:
-                                    best_score = current_score
-                                    iterations_without_improvement = 0
-                                    logger.debug(
-                                        f"New best score: {best_score:.4f} (improvement: {improvement:+.4f})"
-                                    )
-                                else:
-                                    iterations_without_improvement += 1
-                                    logger.debug(
-                                        f"No improvement: {iterations_without_improvement}/{self.config.early_stopping_patience}"
-                                    )
-
-                                # Check if we should stop
-                                if (
-                                    iterations_without_improvement
-                                    >= self.config.early_stopping_patience
-                                ):
-                                    self.early_stopping_triggered = True
-                                    logger.info(
-                                        f"🛑 Early stopping triggered at iteration {completed_iteration}: "
-                                        f"No improvement for {iterations_without_improvement} iterations "
-                                        f"(best score: {best_score:.4f})"
-                                    )
-                                    break
-
+                        else:
+                            # Get the metric to track for early stopping
+                            current_score = None
+                            if self.config.early_stopping_metric in child_program.metrics:
+                                current_score = child_program.metrics[
+                                    self.config.early_stopping_metric
+                                ]
+                            elif self.config.early_stopping_metric == "combined_score":
+                                # Default metric not found, use safe average (standard pattern)
+                                current_score = safe_numeric_average(child_program.metrics)
                             else:
-                                # Event-based early stopping
-                                if current_score == self.config.convergence_threshold:
-                                    best_score = current_score
-                                    logger.info(
-                                        f"🛑 Early stopping (event-based) triggered at iteration {completed_iteration}: "
-                                        f"Task successfully solved with score {best_score:.4f}."
-                                    )
-                                    self.early_stopping_triggered = True
-                                    break
+                                # User specified a custom metric that doesn't exist
+                                logger.warning(
+                                    f"Early stopping metric '{self.config.early_stopping_metric}' not found, using safe numeric average"
+                                )
+                                current_score = safe_numeric_average(child_program.metrics)
+
+                            if current_score is not None and isinstance(
+                                current_score, (int, float)
+                            ):
+                                # Check for improvement
+                                if self.config.early_stopping_patience > 0:
+                                    improvement = current_score - best_score
+                                    if (
+                                        current_score > best_score
+                                        and improvement >= self.config.convergence_threshold
+                                    ):
+                                        best_score = current_score
+                                        iterations_without_improvement = 0
+                                        logger.debug(
+                                            f"New best score: {best_score:.4f} (improvement: {improvement:+.4f})"
+                                        )
+                                    else:
+                                        iterations_without_improvement += 1
+                                        logger.debug(
+                                            f"No improvement: {iterations_without_improvement}/{self.config.early_stopping_patience}"
+                                        )
+
+                                    # Check if we should stop
+                                    if (
+                                        iterations_without_improvement
+                                        >= self.config.early_stopping_patience
+                                    ):
+                                        self.early_stopping_triggered = True
+                                        logger.info(
+                                            f"🛑 Early stopping triggered at iteration {completed_iteration}: "
+                                            f"No improvement for {iterations_without_improvement} iterations "
+                                            f"(best score: {best_score:.4f})"
+                                        )
+                                        break
+
+                                else:
+                                    # Event-based early stopping
+                                    if current_score == self.config.convergence_threshold:
+                                        best_score = current_score
+                                        logger.info(
+                                            f"🛑 Early stopping (event-based) triggered at iteration {completed_iteration}: "
+                                            f"Task successfully solved with score {best_score:.4f}."
+                                        )
+                                        self.early_stopping_triggered = True
+                                        break
 
             except _CandidateRejected as rejected:
-                logger.info("Admission strategy rejected program %s", rejected)
+                logger.info("Database rejected program %s", rejected)
                 try:
                     self._checkpoint_if_due(completed_iteration, checkpoint_callback)
                 except Exception as e:
@@ -946,6 +1107,7 @@ class ProcessParallelController:
             except FutureTimeoutError as e:
                 if getattr(e, "_openevolve_strategy_error", False):
                     raise
+                self.last_iteration_error = f"Iteration timed out after {timeout_seconds}s"
                 logger.error(
                     f"⏰ Iteration {completed_iteration} timed out after {timeout_seconds}s "
                     f"(evaluator timeout: {self.config.evaluator.timeout}s + 30s buffer). "
@@ -953,10 +1115,19 @@ class ProcessParallelController:
                 )
                 # Cancel the future to clean up the process
                 future.cancel()
+                if self.evolution_tracer:
+                    self.evolution_tracer.log_failure(
+                        iteration=completed_iteration, error=self.last_iteration_error
+                    )
             except Exception as e:
                 if getattr(e, "_openevolve_strategy_error", False):
                     raise
+                self.last_iteration_error = str(e)
                 logger.error(f"Error processing result from iteration {completed_iteration}: {e}")
+                if self.evolution_tracer:
+                    self.evolution_tracer.log_failure(
+                        iteration=completed_iteration, error=self.last_iteration_error
+                    )
 
             completed_iterations += 1
 
@@ -1003,6 +1174,21 @@ class ProcessParallelController:
             logger.info("✅ Evolution completed - Shutdown requested")
         else:
             logger.info("✅ Evolution completed - Maximum iterations reached")
+
+        self.completed_iterations = completed_iterations
+        self.successful_iterations = successful_iterations
+        # An interrupted run is not a failed one. Evaluated here, before stop()
+        # sets the shutdown event as part of normal cleanup.
+        self.produced_no_candidates = (
+            completed_iterations > 0
+            and successful_iterations == 0
+            and not self.shutdown_event.is_set()
+        )
+        if self.produced_no_candidates:
+            logger.error(
+                f"❌ None of the {completed_iterations} iterations produced a candidate program. "
+                f"Last error: {self.last_iteration_error}"
+            )
 
         if total_llm_calls > 0:
             logger.info(

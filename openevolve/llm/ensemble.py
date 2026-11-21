@@ -3,9 +3,11 @@ Model ensemble for LLMs
 """
 
 import asyncio
+import hashlib
 import logging
+import math
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from openevolve.config import LLMModelConfig
 from openevolve.llm.antigravity_acp import AntigravityACPLLM
@@ -16,6 +18,31 @@ from openevolve.llm.openai import OpenAILLM
 from openevolve.llm.opencode_cli import OpenCodeCLILLM
 
 logger = logging.getLogger(__name__)
+
+_USAGE_COUNTS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def add_usage(usage: Optional[Dict[str, Any]], extra: Any) -> Optional[Dict[str, Any]]:
+    """`usage` with the token counts and the number of calls in `extra` added.
+
+    `usage` counts as one call unless it has a `calls` count. An `extra` that is not a usage
+    dict from at least one call leaves `usage` unchanged.
+    """
+    if not isinstance(extra, dict) or not extra.get("calls"):
+        return usage
+    merged = dict(usage or {})
+    for key in _USAGE_COUNTS:
+        merged[key] = (merged.get(key) or 0) + (extra.get(key) or 0)
+    merged["calls"] = (merged.get("calls", 1) if usage else 0) + extra["calls"]
+    return merged
+
+
+def take_usage(llm: Any) -> Optional[Dict[str, Any]]:
+    """`llm.take_usage()`, or None for an LLM that does not sum its usage"""
+    take = getattr(llm, "take_usage", None)
+    usage = take() if callable(take) else None
+    return usage if isinstance(usage, dict) else None
+
 
 _PROVIDER_REGISTRY = {
     "openai": lambda cfg: OpenAILLM(cfg),
@@ -39,6 +66,13 @@ try:
 except ImportError:
     pass
 
+try:
+    from openevolve.llm.codex_app_server import CodexAppServerLLM
+
+    _PROVIDER_REGISTRY["codex_app_server"] = lambda cfg: CodexAppServerLLM(cfg)
+except ImportError:
+    pass
+
 
 def _create_model(model_cfg: LLMModelConfig) -> LLMInterface:
     if model_cfg.init_client:
@@ -55,13 +89,22 @@ class LLMEnsemble:
     def __init__(self, models_cfg: List[LLMModelConfig]):
         self.models_cfg = models_cfg
 
-        # Initialize models from the configuration
-        self.models = [_create_model(model_cfg) for model_cfg in models_cfg]
-
-        # Extract and normalize model weights
+        # Validate weights before initializing clients, which may have side effects.
         self.weights = [model.weight for model in models_cfg]
+        if any(not math.isfinite(weight) or weight < 0 for weight in self.weights):
+            raise ValueError("LLM ensemble weights must be finite and non-negative")
         total = sum(self.weights)
-        self.weights = [w / total for w in self.weights]
+        if self.weights and total <= 0:
+            raise ValueError("LLM ensemble must contain at least one model with a positive weight")
+        if not math.isfinite(total):
+            # Finite weights can still overflow when added. Rescale only this
+            # case so ordinary normalization and seeded sampling stay unchanged.
+            scale = max(self.weights)
+            self.weights = [weight / scale for weight in self.weights]
+            total = sum(self.weights)
+        self.weights = [weight / total for weight in self.weights]
+
+        self.models = [_create_model(model_cfg) for model_cfg in models_cfg]
 
         # Set up random state for deterministic model selection
         self.random_state = random.Random()
@@ -88,29 +131,74 @@ class LLMEnsemble:
             logger._ensemble_logged = True
 
         self.last_usage: Optional[Dict[str, Any]] = None
+        # Usage summed over every call since the last take_usage()
+        self._usage: Optional[Dict[str, Any]] = None
+        # Configured name of the model sampled for the latest request
+        self.last_model: Optional[str] = None
+        # Set by reseed(); gives each iteration's requests their own seed
+        self._iteration: Optional[int] = None
 
     async def generate(self, prompt: str, **kwargs) -> str:
         """Generate text using a randomly selected model based on weights"""
-        model = self._sample_model()
-        res = await model.generate(prompt, **kwargs)
-        self.last_usage = getattr(model, "last_usage", None)
+        index = self._sample_index()
+        model = self.models[index]
+        res = await model.generate(prompt, **self._request_kwargs(index, kwargs))
+        self._record_usage(model)
         return res
 
     async def generate_with_context(
         self, system_message: str, messages: List[Dict[str, str]], **kwargs
     ) -> str:
         """Generate text using a system message and conversational context"""
-        model = self._sample_model()
-        res = await model.generate_with_context(system_message, messages, **kwargs)
-        self.last_usage = getattr(model, "last_usage", None)
+        index = self._sample_index()
+        model = self.models[index]
+        res = await model.generate_with_context(
+            system_message, messages, **self._request_kwargs(index, kwargs)
+        )
+        self._record_usage(model)
         return res
+
+    def _record_usage(self, model: LLMInterface) -> None:
+        """Keep the usage `model` reported for the call it just answered"""
+        self.last_usage = getattr(model, "last_usage", None)
+        if isinstance(self.last_usage, dict):
+            self._usage = add_usage(self._usage, dict(self.last_usage, calls=1))
+
+    def take_usage(self) -> Optional[Dict[str, Any]]:
+        """Token counts and number of calls summed since the last take, or None; restarts the sum"""
+        usage, self._usage = self._usage, None
+        return usage
+
+    def reseed(self, iteration: int) -> None:
+        """Seed model sampling from the configured seed and `iteration`, so the pick depends
+        on the iteration rather than on how many picks this worker process has already made"""
+        seed = getattr(self.models_cfg[0], "random_seed", None) if self.models_cfg else None
+        if seed is not None:
+            self.random_state.seed(f"{seed}:{iteration}")
+        self._iteration = iteration
+
+    def _request_kwargs(self, index: int, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """After reseed(iteration), send a seed derived from the model's seed and the
+        iteration. A fixed seed would make every identical prompt (common early on, when
+        iterations share a parent) return the identical response on providers that honour it"""
+        if self._iteration is None or "seed" in kwargs:
+            return kwargs
+        seed = getattr(self.models_cfg[index], "random_seed", None)
+        if seed is None:
+            return kwargs
+        digest = hashlib.sha256(f"{seed}:{self._iteration}:request".encode()).digest()
+        return {**kwargs, "seed": int.from_bytes(digest[:4], "big") & 0x7FFFFFFF}
+
+    def _sample_index(self) -> int:
+        """Index of a model sampled from the ensemble based on weights"""
+        index = self.random_state.choices(range(len(self.models)), weights=self.weights, k=1)[0]
+        self.last_model = self.models_cfg[index].name
+        logger.info(f"Sampled model: {self.last_model}")
+        return index
 
     def _sample_model(self) -> LLMInterface:
         """Sample a model from the ensemble based on weights"""
-        index = self.random_state.choices(range(len(self.models)), weights=self.weights, k=1)[0]
-        sampled_model = self.models[index]
-        logger.info(f"Sampled model: {vars(sampled_model)['model']}")
-        return sampled_model
+        return self.models[self._sample_index()]
 
     async def generate_multiple(self, prompt: str, n: int, **kwargs) -> List[str]:
         """Generate multiple texts in parallel"""
@@ -124,9 +212,17 @@ class LLMEnsemble:
 
     async def generate_all_with_context(
         self, system_message: str, messages: List[Dict[str, str]], **kwargs
-    ) -> str:
-        """Generate text using a all available models and average their returned metrics"""
-        responses = []
-        for model in self.models:
+    ) -> List[Optional[str]]:
+        """Request feedback from positive-weight models.
+
+        Keep a None slot for each disabled model so response indices still match
+        the ensemble weights when the evaluator aggregates and logs feedback.
+        """
+        responses: List[Optional[str]] = []
+        for model, weight in zip(self.models, self.weights):
+            if weight <= 0:
+                responses.append(None)
+                continue
             responses.append(await model.generate_with_context(system_message, messages, **kwargs))
+            self._record_usage(model)
         return responses

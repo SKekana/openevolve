@@ -90,8 +90,9 @@ class EmbeddingClient:
                 of strings.
 
         Returns:
-            list: Embedding vector for the code or None if an error
-                occurs.
+            list: Embedding vector for a string, or one vector per batch input
+                in input order.
+                On failure, return an empty vector for each input.
         """
         if isinstance(code, str):
             code = [code]
@@ -106,10 +107,10 @@ class EmbeddingClient:
             if single_code:
                 return response.data[0].embedding
             else:
-                return [d.embedding for d in response.data]
+                return [d.embedding for d in sorted(response.data, key=lambda d: d.index)]
         except Exception as e:
             logger.info(f"Error getting embedding: {e}")
             if single_code:
-                return [], 0.0
+                return []
             else:
-                return [[]], 0.0
+                return [[] for _ in code]

@@ -18,6 +18,7 @@ PARENT_CODE = "x = 1\ny = 1"
 VALID_BLOCK = "<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE\n"
 EXTRA_SEPARATOR = "<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n=======\n>>>>>>> REPLACE\n"
 USAGE = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+MODEL = "test-model"
 
 
 class _WorkerTestBase(unittest.TestCase):
@@ -52,10 +53,12 @@ class _WorkerTestBase(unittest.TestCase):
         self.sampler = MagicMock()
         self.sampler.build_prompt.return_value = {"system": "sys", "user": "usr"}
 
-    def _run(self, llm_response):
+    def _run(self, llm_response, llm_error=None, usage=USAGE):
+        self.llm_response = llm_response
         llm = MagicMock()
-        llm.generate_with_context = AsyncMock(return_value=llm_response)
-        llm.last_usage = USAGE
+        llm.generate_with_context = AsyncMock(return_value=llm_response, side_effect=llm_error)
+        llm.last_usage = usage
+        llm.last_model = MODEL
         # Worker globals are only created in worker processes, hence create=True.
         with patch.multiple(
             process_parallel_module,
@@ -72,6 +75,10 @@ class _WorkerTestBase(unittest.TestCase):
         self.assertIn(message, result.error)
         self.assertEqual(result.iteration, 3)
         self.assertEqual(result.token_usage, USAGE)
+        # Kept so failed iterations can be inspected (evolution_trace.include_failures)
+        self.assertEqual(result.llm_response, self.llm_response)
+        self.assertEqual(result.prompt, {"system": "sys", "user": "usr"})
+        self.assertEqual(result.parent_id, "parent")
         self.evaluator.evaluate_program.assert_not_called()
 
     def evaluated_code(self):
@@ -122,6 +129,64 @@ class TestWorkerDiffFormatValidation(_WorkerTestBase):
         self.assertIsNone(result.error)
         self.assertEqual(result.child_program_dict["code"], "x = 2\n=======\ny = 1")
         self.evaluator.evaluate_program.assert_called_once()
+
+
+class TestWorkerLLMFailures(_WorkerTestBase):
+    """Failed LLM calls still say what was asked, for evolution_trace.include_failures"""
+
+    def _assert_keeps_context(self, result, message):
+        self.assertIsNone(result.child_program_dict)
+        self.assertIn(message, result.error)
+        self.assertEqual(result.prompt, {"system": "sys", "user": "usr"})
+        self.assertEqual(result.parent_id, "parent")
+        self.assertEqual(result.target_island, 0)
+        self.assertEqual(result.evolution_mode, "diff")
+        self.assertIsNone(result.llm_response)
+        self.evaluator.evaluate_program.assert_not_called()
+
+    def test_llm_exception(self):
+        result = self._run(None, llm_error=RuntimeError("connection refused"))
+        self._assert_keeps_context(result, "LLM generation failed: connection refused")
+        self.assertIsNone(result.token_usage)
+
+    def test_llm_returns_none(self):
+        result = self._run(None)
+        self._assert_keeps_context(result, "LLM returned None response")
+        self.assertEqual(result.token_usage, USAGE)
+
+
+class TestWorkerTruncatedResponse(_WorkerTestBase):
+    """A response cut off at llm.max_tokens says so in the iteration error"""
+
+    CUT_OFF = dict(USAGE, finish_reason="length")
+
+    def test_cut_off_before_any_diff(self):
+        result = self._run("Plan: first I will", usage=self.CUT_OFF)
+        self.assertEqual(
+            result.error,
+            "No valid diffs found in response (response was cut off at llm.max_tokens)",
+        )
+        self.evaluator.evaluate_program.assert_not_called()
+
+    def test_cut_off_inside_a_diff(self):
+        result = self._run(VALID_BLOCK.replace(">>>>>>> REPLACE\n", ""), usage=self.CUT_OFF)
+        self.assertIn("(response was cut off at llm.max_tokens)", result.error)
+        self.evaluator.evaluate_program.assert_not_called()
+
+    def test_complete_response_error_is_unchanged(self):
+        result = self._run(
+            "I could not think of a change.", usage=dict(USAGE, finish_reason="stop")
+        )
+        self.assertEqual(result.error, "No valid diffs found in response")
+
+
+class TestWorkerRecordsModel(_WorkerTestBase):
+    """Each program records the model that generated it (#381)"""
+
+    def test_child_metadata_has_llm_model(self):
+        result = self._run(VALID_BLOCK)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.child_program_dict["metadata"]["llm_model"], MODEL)
 
 
 class TestWorkerUnappliedDiffs(_WorkerTestBase):
@@ -232,6 +297,24 @@ class TestWorkerEnforceEvolveBlocks(_WorkerTestBase):
         config = Config.from_dict({"enforce_evolve_blocks": True})
         self.assertTrue(config.enforce_evolve_blocks)
         self.assertTrue(config.to_dict()["enforce_evolve_blocks"])
+
+
+class TestWorkerCountsEvaluatorUsage(_WorkerTestBase):
+    """The evaluator's LLM feedback calls are added to the iteration's token usage"""
+
+    def test_evaluator_usage_is_added(self):
+        self.evaluator.llm_ensemble.take_usage.return_value = {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8,
+            "calls": 2,
+        }
+        result = self._run(VALID_BLOCK)
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            result.token_usage,
+            {"prompt_tokens": 16, "completion_tokens": 10, "total_tokens": 26, "calls": 3},
+        )
 
 
 if __name__ == "__main__":

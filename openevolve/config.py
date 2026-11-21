@@ -2,6 +2,7 @@
 Configuration handling for OpenEvolve
 """
 
+import logging
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -14,6 +15,7 @@ import yaml
 if TYPE_CHECKING:
     from openevolve.llm.base import LLMInterface
 
+logger = logging.getLogger(__name__)
 
 _ENV_VAR_PATTERN = re.compile(r"^\$\{([^}]+)\}$")  # ${VAR}
 
@@ -150,7 +152,10 @@ class LLMConfig(LLMModelConfig):
         if self.primary_model:
             # Create primary model
             primary_model = LLMModelConfig(
-                name=self.primary_model, weight=self.primary_model_weight or 1.0
+                name=self.primary_model,
+                weight=(
+                    self.primary_model_weight if self.primary_model_weight is not None else 1.0
+                ),
             )
             self.models.append(primary_model)
 
@@ -225,7 +230,10 @@ class LLMConfig(LLMModelConfig):
         if self.primary_model:
             # Create primary model
             primary_model = LLMModelConfig(
-                name=self.primary_model, weight=self.primary_model_weight or 1.0
+                name=self.primary_model,
+                weight=(
+                    self.primary_model_weight if self.primary_model_weight is not None else 1.0
+                ),
             )
             self.models.append(primary_model)
 
@@ -338,6 +346,9 @@ class DatabaseConfig:
     population_size: int = 1000
     archive_size: int = 100
     num_islands: int = 5
+    # Entry i is the program island i starts from; null or missing keeps the default.
+    # Island 0 always starts from the initial program passed on the command line.
+    island_initial_programs: List[Optional[str]] = field(default_factory=list)
 
     # Selection parameters
     elite_selection_ratio: float = 0.1
@@ -387,6 +398,19 @@ class DatabaseConfig:
     embedding_api_base: Optional[str] = None
     similarity_threshold: float = 0.99
 
+    def validate_island_initial_programs(self) -> None:
+        """Check island_initial_programs against num_islands and the island 0 rule"""
+        if len(self.island_initial_programs) > self.num_islands:
+            raise ValueError(
+                "database.island_initial_programs has more entries than database.num_islands"
+            )
+
+        if self.island_initial_programs and self.island_initial_programs[0] is not None:
+            raise ValueError(
+                "database.island_initial_programs[0] must be null; island 0 starts from the "
+                "initial program passed on the command line"
+            )
+
 
 @dataclass
 class EvaluatorConfig:
@@ -418,6 +442,11 @@ class EvaluatorConfig:
     enable_artifacts: bool = True
     max_artifact_storage: int = 100 * 1024 * 1024  # 100MB per program
 
+    # Extra keyword arguments forwarded to the user's evaluate() function
+    # (only applied when its signature accepts them; see openevolve.evaluator).
+    # Settable via YAML ('evaluator.evaluator_args') or the --evaluator-args CLI flag.
+    evaluator_args: Optional[Dict[str, Any]] = None
+
 
 @dataclass
 class EvolutionTraceConfig:
@@ -427,6 +456,9 @@ class EvolutionTraceConfig:
     format: str = "jsonl"  # Options: "jsonl", "json", "hdf5"
     include_code: bool = False
     include_prompts: bool = True
+    # Also record iterations that failed before a child program existed (unparseable
+    # response, diff that did not apply, ...) in <output_path stem>_failures.jsonl
+    include_failures: bool = False
     output_path: Optional[str] = None
     buffer_size: int = 10
     compress: bool = False
@@ -439,8 +471,12 @@ class Config:
     # General settings
     max_iterations: int = 10000
     checkpoint_interval: int = 100
+    checkpoint_on_improvement: bool = False
     log_level: str = "INFO"
     log_dir: Optional[str] = None
+    # Optional prefix applied to all OpenEvolve logger names (e.g. "run1" logs
+    # as "run1.openevolve.*"), useful to tell apart concurrent runs (issue #290)
+    logger_prefix: Optional[str] = None
     random_seed: Optional[int] = 42
     language: str = None
     file_suffix: str = ".py"
@@ -454,6 +490,9 @@ class Config:
 
     # Evolution settings
     diff_based_evolution: bool = True
+    # With diff_based_evolution, the chance that an iteration asks for a full rewrite instead
+    # of SEARCH/REPLACE diffs (issue #116). 0.0 keeps every iteration diff-based
+    full_rewrite_probability: float = 0.0
     max_code_length: int = 10000
     # Revert any LLM edits outside the EVOLVE-BLOCK-START/END regions
     enforce_evolve_blocks: bool = False
@@ -481,6 +520,16 @@ class Config:
             if not template_path.is_absolute():
                 config.prompt.template_dir = str((config_path.parent / template_path).resolve())
 
+        # Resolve island_initial_programs relative to config file location
+        config.database.island_initial_programs = [
+            (
+                str((config_path.parent / seed_path).resolve())
+                if seed_path is not None and not Path(seed_path).is_absolute()
+                else seed_path
+            )
+            for seed_path in config.database.island_initial_programs
+        ]
+
         return config
 
     @classmethod
@@ -498,6 +547,16 @@ class Config:
                 del config_dict["llm"]["temperature"]
             if "top_p" in config_dict["llm"] and config_dict["llm"]["top_p"] is None:
                 del config_dict["llm"]["top_p"]
+            # 'model' is not a config field (models are 'llm.models' or
+            # 'llm.primary_model'), and dacite silently drops unknown keys. Left
+            # unchecked, such configs pass validation with an empty model ensemble
+            # and every LLM call later fails with "IndexError: list index out of
+            # range" (issue #427). Fail here with the correct spelling instead.
+            if isinstance(config_dict["llm"], dict) and "model" in config_dict["llm"]:
+                raise ValueError(
+                    "Invalid config key 'llm.model'. Use 'llm.primary_model' or the "
+                    "'llm.models' array instead (see README configuration section)."
+                )
 
         config: Config = dacite.from_dict(
             data_class=cls,
@@ -516,13 +575,53 @@ class Config:
                 "prompt.island_system_messages has more entries than database.num_islands"
             )
 
-        if config.prompt.programs_as_changes_description and not config.diff_based_evolution:
-            raise ValueError(
-                "prompt.programs_as_changes_description=true requires diff_based_evolution=true "
-                "(full rewrites cannot reliably update code and changes_description together)"
-            )
+        config.database.validate_island_initial_programs()
+
+        config.validate_evolution_mode()
+
+        config.resolve_system_message()
 
         return config
+
+    def resolve_system_message(self) -> None:
+        """Make a system message set under llm reach the prompt.
+
+        The prompt sampler only reads prompt.system_message, so a message set as
+        llm.system_message used to be replaced by the default template without a warning.
+        Afterwards both fields hold the message in use, so a second call does nothing.
+        """
+        llm_message = self.llm.system_message
+        if llm_message is None or llm_message == LLMConfig.system_message:
+            return
+        if self.prompt.system_message == PromptConfig.system_message:
+            logger.warning(
+                "llm.system_message is not read by the prompt sampler; using it as "
+                "prompt.system_message. Set prompt.system_message instead."
+            )
+            self.prompt.system_message = llm_message
+        elif self.prompt.system_message != llm_message:
+            logger.warning(
+                "Both llm.system_message and prompt.system_message are set; ignoring llm.system_message."
+            )
+            self.llm.system_message = self.prompt.system_message
+
+    def validate_evolution_mode(self) -> None:
+        """Check that diff_based_evolution, full_rewrite_probability and
+        prompt.programs_as_changes_description agree"""
+        p = self.full_rewrite_probability
+        if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0.0 <= p <= 1.0:
+            raise ValueError(f"full_rewrite_probability must be between 0 and 1, got {p!r}")
+        if p > 0 and not self.diff_based_evolution:
+            raise ValueError(
+                "full_rewrite_probability only applies when diff_based_evolution=true "
+                "(diff_based_evolution=false already makes every iteration a full rewrite)"
+            )
+        if self.prompt.programs_as_changes_description and (not self.diff_based_evolution or p > 0):
+            raise ValueError(
+                "prompt.programs_as_changes_description=true requires diff_based_evolution=true "
+                "and full_rewrite_probability=0 (full rewrites cannot reliably update code and "
+                "changes_description together)"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

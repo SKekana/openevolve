@@ -6,6 +6,7 @@ from openevolve.llm.antigravity_acp import AntigravityACPLLM, init_antigravity_a
 from openevolve.llm.antigravity_cli import AntigravityCLILLM, init_antigravity_cli_client
 from openevolve.llm.base import LLMInterface
 from openevolve.llm.claude_code import ClaudeCodeLLM, init_claude_code_client
+from openevolve.llm.codex_app_server import CodexAppServerLLM, init_codex_app_server_client
 from openevolve.llm.codex_cli import CodexCLILLM, init_codex_cli_client
 from openevolve.llm.copilot_cli import CopilotCLILLM, init_copilot_cli_client
 from openevolve.llm.ensemble import LLMEnsemble
@@ -27,5 +28,7 @@ __all__ = [
     "init_codex_cli_client",
     "OpenCodeCLILLM",
     "init_opencode_cli_client",
+    "CodexAppServerLLM",
+    "init_codex_app_server_client",
     "LLMEnsemble",
 ]

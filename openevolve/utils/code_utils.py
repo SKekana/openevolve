@@ -5,7 +5,6 @@ Utilities for code parsing, diffing, and manipulation
 import re
 from typing import Dict, List, Optional, Tuple, Union
 
-
 _STANDARD_DIFF_PATTERN = r"<<<<<<< SEARCH\n(.*?)=======\n(.*?)>>>>>>> REPLACE"
 _STANDARD_DIFF_MARKER = re.compile(
     r"^[ \t]*(<<<<<<< SEARCH|=======|>>>>>>> REPLACE)[ \t]*\r?$", re.MULTILINE
@@ -207,24 +206,44 @@ def extract_diffs(
         ValueError: The standard SEARCH/REPLACE response has an extra or
             unmatched delimiter line. Custom diff patterns retain their own grammar.
     """
-    matches = list(re.finditer(diff_pattern, diff_text, re.DOTALL))
     if diff_pattern == _STANDARD_DIFF_PATTERN:
-        # A permissive regex can absorb a second separator into replacement
-        # text and then insert it as code. Validate the complete response's
-        # delimiter lines before applying any matched block.
-        cursor = 0
-        for match in matches:
-            if _STANDARD_DIFF_MARKER.search(diff_text[cursor : match.start()]):
-                raise ValueError("Unmatched SEARCH/REPLACE delimiter outside a diff block")
-            block_markers = [
-                marker.group(1) for marker in _STANDARD_DIFF_MARKER.finditer(match.group(0))
-            ]
-            if block_markers != ["<<<<<<< SEARCH", "=======", ">>>>>>> REPLACE"]:
-                raise ValueError("Malformed SEARCH/REPLACE delimiter sequence")
-            cursor = match.end()
-        if _STANDARD_DIFF_MARKER.search(diff_text[cursor:]):
-            raise ValueError("Unmatched SEARCH/REPLACE delimiter outside a diff block")
+        return _extract_standard_diffs(diff_text)
+    matches = re.finditer(diff_pattern, diff_text, re.DOTALL)
     return [(match.group(1).rstrip(), match.group(2).rstrip()) for match in matches]
+
+
+def _extract_standard_diffs(diff_text: str) -> List[Tuple[str, str]]:
+    """
+    Extract SEARCH/REPLACE blocks delimited by whole marker lines
+
+    A marker only counts on a line of its own, so code such as a "# =====" banner
+    comment stays part of a block. Every marker line in the response is checked
+    before any block is returned: a permissive match could otherwise absorb a
+    second separator into replacement text and insert it as code.
+    """
+    markers = ["<<<<<<< SEARCH", "=======", ">>>>>>> REPLACE"]
+    blocks: List[Tuple[str, str]] = []
+    texts: List[str] = []  # SEARCH and REPLACE text of the block being read
+    expected = 0
+    section_start = 0
+    for marker in _STANDARD_DIFF_MARKER.finditer(diff_text):
+        token = marker.group(1)
+        if token != markers[expected]:
+            if token == markers[1] and expected == 2:
+                raise ValueError("Malformed SEARCH/REPLACE delimiter sequence")
+            raise ValueError("Unmatched SEARCH/REPLACE delimiter outside a diff block")
+        if expected > 0:
+            section = diff_text[section_start : marker.start()]
+            texts.append(section.replace("\r\n", "\n").rstrip())
+        # A section's text starts on the line after its marker
+        section_start = marker.end() + 1
+        expected = (expected + 1) % 3
+        if expected == 0:
+            blocks.append((texts[0], texts[1]))
+            texts = []
+    if expected:
+        raise ValueError("Unmatched SEARCH/REPLACE delimiter outside a diff block")
+    return blocks
 
 
 def parse_full_rewrite(llm_response: str, language: str = "python") -> Optional[str]:
@@ -238,14 +257,14 @@ def parse_full_rewrite(llm_response: str, language: str = "python") -> Optional[
     Returns:
         Extracted code or None if not found
     """
-    code_block_pattern = r"```" + language + r"\n(.*?)```"
+    code_block_pattern = r"```" + re.escape(language) + r"[ \t]*\r?\n(.*?)```"
     matches = re.findall(code_block_pattern, llm_response, re.DOTALL)
 
     if matches:
         return matches[0].strip()
 
-    # Fallback to any code block
-    code_block_pattern = r"```(.*?)```"
+    # Fallback to any code block, without its language tag if it has one
+    code_block_pattern = r"```(?:[^\s`]*[ \t]*\r?\n)?(.*?)```"
     matches = re.findall(code_block_pattern, llm_response, re.DOTALL)
 
     if matches:
@@ -348,7 +367,10 @@ def extract_code_language(code: str) -> str:
         Detected language or "unknown"
     """
     # Look for common language signatures
-    if re.search(r"^(import|from|def|class)\s", code, re.MULTILINE):
+    # Java imports also match Python's generic import signature.
+    if re.search(r"^(import|from|def|class)\s", code, re.MULTILINE) and not re.search(
+        r"^(package\s+[\w.]+\s*;|public class\s)", code, re.MULTILINE
+    ):
         return "python"
     elif re.search(r"^(package|import java|public class)", code, re.MULTILINE):
         return "java"
@@ -367,12 +389,7 @@ def extract_code_language(code: str) -> str:
 def _can_apply_linewise(haystack_lines: List[str], needle_lines: List[str]) -> bool:
     if not needle_lines:
         return False
-
-    for i in range(len(haystack_lines) - len(needle_lines) + 1):
-        if haystack_lines[i : i + len(needle_lines)] == needle_lines:
-            return True
-
-    return False
+    return _find_search_lines(haystack_lines, needle_lines) >= 0
 
 
 def apply_diff_blocks(original_text: str, diff_blocks: List[Tuple[str, str]]) -> Tuple[str, int]:
@@ -401,8 +418,8 @@ def split_diffs_by_target(
     changes_description_text: str,
 ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str]]]:
     """
-    Route diff blocks to either code or changes_description based on exact line-wise match
-    of SEARCH text. Returns (code_blocks, changes_desc_blocks, unmatched_blocks)
+    Route diff blocks using the same exact-then-trailing-whitespace matching as
+    application. Returns (code_blocks, changes_desc_blocks, unmatched_blocks).
 
     If a SEARCH matches both targets, it's ambiguous and we raise error
     """
